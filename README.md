@@ -1,6 +1,6 @@
 # iidxFindPatternApp
 
-[textage.cc](https://textage.cc/) から beatmania IIDX の譜面データを収集し、機械学習 (KMeans クラスタリング) で譜面の傾向パターンを発見するツール。
+[textage.cc](https://textage.cc/) から beatmania IIDX の譜面データを収集し、機械学習 (KMeans クラスタリング) で譜面の傾向パターンを発見するツール。今回はレベル10~12のみを対象としている。
 
 ## 構成
 
