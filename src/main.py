@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         help="前回学習した結果 (assignments.csv) をクラスタ別に整形表示する",
     )
     p.add_argument(
+        "--browse",
+        action="store_true",
+        help="対話式の譜面ブラウザを起動する "
+             "(曲名 50音順 / レベル別に選択して単体情報を表示)",
+    )
+    p.add_argument(
         "--show-clusters-top",
         type=int,
         default=20,
@@ -392,6 +398,10 @@ def main() -> int:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.browse:
+        from browse import run_browser
+        return run_browser(RESULTS_DIR, CACHE_DIR, MODEL_DIR)
 
     if args.show_clusters:
         return show_clusters(args.show_clusters_top)

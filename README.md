@@ -11,6 +11,7 @@
 - `src/random_sim.py` — RANDOM オプションの当たり外れシミュレーション (7! 順列の運指コスト分布)
 - `src/features.py` — デコード済みノート列から特徴量ベクトルを抽出
 - `src/ml.py` — 標準化 + KMeans によるパターン発見 (PCA は可視化用)
+- `src/browse.py` — 対話式の譜面ブラウザ (曲名 50 音順 / レベル別に単体情報を参照)
 
 ## textage のデータ形式について
 
@@ -60,7 +61,28 @@ python src/main.py --predict "https://textage.cc/score/0/100seckb.html?1AA00"
 # 学習結果をクラスタ別に整形表示
 python src/main.py --show-clusters
 python src/main.py --show-clusters --show-clusters-top 50  # 各クラスタ 50 譜面まで
+
+# 対話式の譜面ブラウザ (曲単体の情報を参照)
+python src/main.py --browse
 ```
+
+### 譜面ブラウザ (`--browse`)
+
+学習済みデータにある譜面を選択して、単体の情報
+(基本情報 / クラスタ / 全特徴量の値と z-score / RANDOM オプション判断) を表示する。
+
+- **[1] 曲名 (50 音順) から選ぶ** — あ〜わ行 / A-Z (頭文字別) / 数字 / 漢字・他 の
+  グループから曲を選び、難易度 (BEGINNER〜LEGGENDARIA のうち収録があるもの) を選ぶ
+- **[2] レベル (1-12) から選ぶ** — レベルを選ぶと該当譜面が 50 音順で一覧される
+
+備考:
+
+- かな曲名はカタカナ→ひらがな・濁点・拗音を正規化して正確な 50 音順で並ぶ。
+  漢字始まりの曲名は読み仮名データが存在しないため (textage 側にも無い)、
+  「漢字・他」グループに文字コード順でまとめている
+- 事前に学習 (`--skip-scrape` 等) を済ませて `data/results/assignments.csv` を
+  生成しておくこと。現在のデータセットは Lv10-12 の一覧が取得元のため、
+  実際に選べる難易度は HYPER / ANOTHER / LEGGENDARIA が中心
 
 ### テストモード (`--test`)
 
