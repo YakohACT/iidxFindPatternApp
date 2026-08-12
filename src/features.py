@@ -1,36 +1,56 @@
 """譜面の生データから機械学習向けの特徴量ベクトルを生成するモジュール。
 
-textage.cc の譜面ノートデータ ``sp`` / ``dp`` は次の構造になっている:
+ノート展開は textage_notes モジュール (textage.cc レンダラの移植)、
+配置パターン検出は patterns モジュールが行う。
+時間の単位は textage 準拠で **1 拍 = 96、4/4 拍子の 1 小節 = 384**。
+レーンは **0 = スクラッチ、1..7 = 鍵盤 1〜7**。
 
-    sp = [
-        null,                    # 0 番目はメタ用
-        "x04008@0510@04...",     # 初期 BPM / 拍子等 (メタ行: 'x' や '@' を含む)
-        "01",                    # 短いメタ
-        "0000000000000008",      # 16 桁 hex = 8 byte = 1 小節
-        "8100000204400010",      # 同上
-        ...
-    ]
+抽出する特徴量 (26 次元):
 
-16 桁 hex の各バイト (= 2 hex 文字) を「1 小節中の 1/8 拍 (= 1 tick)」とみなし、
-各バイトの 8 ビットを 8 レーン (SP の場合: 1=スクラッチ + 7=鍵盤) のビットマスク
-として扱う。これにより、
+  基本量:
+  - total_notes:     総ノート数 (CN/BSS の開始を含む)
+  - measures:        最初のノートから最後のノートまでの長さ (4/4 小節換算)
+  - density:         ノート数 / 小節
+  - scratch_ratio:   スクラッチ比率
+  - mean_chord:      同時押し平均サイズ
+  - max_chord:       同時押し最大サイズ
+  - peak_density:    2 拍 (192 単位) 幅の滑走窓に入る最大ノート数 (発狂)
+  - stream16_ratio:  16 分間隔で長く続く塊 (乱打) のノート比率
 
-  byte_index (0..7) × bit_index (0..7) = (tick, lane)
+  階段系:
+  - stair_mono_ratio:    単階段 (1→2→3 と同方向に続く) のノート比率
+  - stair_turn_ratio:    折り返し階段 (1→2→3→2→1) のノート比率
+  - big_stair_rate:      大階段 (1→7 の 7 連) の小節あたり出現回数
+  - double_stair_ratio:  二重階段 (1,3→2,4→3,5) のノート比率
+  - garbage_stair_ratio: ゴミ付き階段 (階段+余分な同時打鍵) のノート比率
 
-の (時刻, レーン) のペアにフラット化できる。
+  リズム/同時押し系:
+  - denim_ratio:       デニム (1,3,5,7⇔2,4,6 型の交互押し) のノート比率
+  - chord_trill_ratio: 二重トリル (1,3⇔2,4 等の同時押し往復) のノート比率
+  - trill_ratio:       トリル (2 レーン往復 4 打以上) のノート比率
+  - jack_ratio:        縦連 (同一鍵盤 16 分 3 打以上) のノート比率
+  - wall_ratio:        壁 (3 個以上の同時押しの連続) のノート比率
+  - axis_ratio:        軸 (同一鍵盤が 4 分以内で降り続け合間に他レーン) のノート比率
 
-抽出する特徴量:
-  - total_notes: 総ノート数
-  - measures:    小節数
-  - density:     ノート数 / 小節
-  - lane0..6_ratio: 鍵盤 1〜7 ごとのノート比率
-  - scratch_ratio:  スクラッチ比率
-  - mean_chord:  同時押し平均サイズ
-  - max_chord:   同時押し最大サイズ
-  - peak_density: 連続 4 tick の最大ノート数
-  - stair_ratio: 隣接レーンへの連続移動率
-  - trill_ratio: 2 レーン間の往復率
-  - has_long_notes: ロングノート/CN を含むか (0/1)
+  スクラッチ系:
+  - scratch_stream_ratio:   連皿 (8 分以内 3 打以上) のノート比率
+  - scratch_key_mix_ratio:  皿複合 (前後 16 分以内に鍵盤があるスクラッチ) の比率
+  - scratch_left_chord_ratio: 無理皿気味 (皿と 1,2 鍵の同時) の比率 (1P 基準)
+  - mss_rate:               マルチスピンスクラッチの小節あたり本数
+
+  その他:
+  - peak_position:   最も密度が高い 2 拍窓の曲中の位置 (0=序盤, 1=ラスト。ラス殺し検出)
+  - offgrid_ratio:   16 分グリッドに乗らないノート比率 (24分/32分/ズレ)
+  - hand_bias:       左手側 (1-3) と右手側 (5-7) の偏り (0=均等)
+  - cn_ratio:        CN/HCN/BSS 開始ノートの比率
+  - bpm_range_log2:  log2(最大BPM/最小BPM)。0 = BPM 一定、1 = 2 倍変化
+  - bpm_change_rate: BPM 変化回数 / 小節 (ソフランの頻度)
+
+  RANDOM オプション判断 (random_sim による 7! 順列シミュレーション):
+  - random_advantage: 正規配置がランダム平均よりどれだけ悪いか (z-score)。
+                      正 = 乱を掛ける価値あり / 負 = 正規当たり配置
+  - random_gamble:    乱の当たり外れの激しさ (コスト分布の変動係数)
+  - mirror_advantage: MIRROR にするとどれだけ得か (z-score)。正 = 鏡推奨
 """
 
 from __future__ import annotations
@@ -40,29 +60,47 @@ from typing import Iterable
 
 import numpy as np
 
+import patterns
+import random_sim
+from textage_notes import LNDEF, N_LANES, decode_charge_notes, decode_notes
 
-N_LANES = 8        # IIDX SP: 7 keys + 1 scratch
-TICKS_PER_BAR = 8  # 16 hex chars = 8 bytes = 8 ticks/小節
+
+PEAK_WINDOW = 192  # 2 拍 (= 半小節 @ 4/4) の滑走窓
 
 
 FEATURE_NAMES = [
     "total_notes",
     "measures",
     "density",
-    "lane0_ratio",
-    "lane1_ratio",
-    "lane2_ratio",
-    "lane3_ratio",
-    "lane4_ratio",
-    "lane5_ratio",
-    "lane6_ratio",
     "scratch_ratio",
     "mean_chord",
     "max_chord",
     "peak_density",
-    "stair_ratio",
+    "stream16_ratio",
+    "stair_mono_ratio",
+    "stair_turn_ratio",
+    "big_stair_rate",
+    "double_stair_ratio",
+    "garbage_stair_ratio",
+    "denim_ratio",
+    "chord_trill_ratio",
     "trill_ratio",
-    "has_long_notes",
+    "jack_ratio",
+    "wall_ratio",
+    "axis_ratio",
+    "scratch_stream_ratio",
+    "scratch_key_mix_ratio",
+    "scratch_left_chord_ratio",
+    "mss_rate",
+    "peak_position",
+    "offgrid_ratio",
+    "hand_bias",
+    "cn_ratio",
+    "bpm_range_log2",
+    "bpm_change_rate",
+    "random_advantage",
+    "random_gamble",
+    "mirror_advantage",
 ]
 
 
@@ -76,111 +114,20 @@ class FeatureVector:
     feature_names: list[str]
 
 
-def _is_hex_row(s) -> bool:
-    if not isinstance(s, str) or not s:
-        return False
-    if any(c in s for c in "@xX"):
-        return False
-    return all(c in "0123456789abcdefABCDEF" for c in s)
-
-
-def parse_notes(raw_notes) -> list[tuple[int, int]]:
-    """sp / dp 配列を ``[(global_tick, lane), ...]`` の昇順リストへ展開する。
-
-    各バイトの bit_i は **i 番目のレーン** に対応すると仮定する (lane 0..7)。
-    レーンの物理的な意味付け (1 鍵 / スクラッチ等) は textage 内部実装に依存
-    するため、特徴量抽出では「あるレーン番号のノート数」として均一に扱う。
-    """
-    notes: list[tuple[int, int]] = []
-    if not isinstance(raw_notes, list):
-        return notes
-
-    bar_idx = 0
-    for item in raw_notes:
-        if not _is_hex_row(item):
-            continue
-        # 16 桁を 8 バイトに区切る (足りない場合は 0 詰め)
-        s = item.zfill(16)[-16:]
-        for tick, two in enumerate([s[i:i + 2] for i in range(0, 16, 2)]):
-            try:
-                byte_val = int(two, 16)
-            except ValueError:
-                continue
-            if byte_val == 0:
-                continue
-            for lane in range(N_LANES):
-                if byte_val & (1 << lane):
-                    notes.append((bar_idx * TICKS_PER_BAR + tick, lane))
-        bar_idx += 1
-    notes.sort()
-    return notes
-
-
-def _chord_sizes(notes: list[tuple[int, int]]) -> list[int]:
-    if not notes:
-        return []
-    sizes: list[int] = []
-    cur_tick = notes[0][0]
-    cur_lanes = {notes[0][1]}
-    for tick, lane in notes[1:]:
-        if tick == cur_tick:
-            cur_lanes.add(lane)
-        else:
-            sizes.append(len(cur_lanes))
-            cur_tick = tick
-            cur_lanes = {lane}
-    sizes.append(len(cur_lanes))
-    return sizes
-
-
-def _peak_density(notes: list[tuple[int, int]], window: int = 4) -> int:
-    """連続 `window` tick 中の最大ノート数 (滑走窓)。"""
-    if not notes:
-        return 0
-    ticks = [t for t, _ in notes]
+def _peak_density(positions: list[float], window: float = PEAK_WINDOW) -> tuple[int, float]:
+    """幅 `window` (ln 単位) の滑走窓に入る最大ノート数と、その窓の中心位置。"""
+    if not positions:
+        return 0, 0.0
     max_count = 0
+    peak_center = positions[0]
     left = 0
-    for right in range(len(ticks)):
-        while ticks[right] - ticks[left] > window:
+    for right in range(len(positions)):
+        while positions[right] - positions[left] > window:
             left += 1
         if right - left + 1 > max_count:
             max_count = right - left + 1
-    return max_count
-
-
-def _stair_trill_ratios(notes: list[tuple[int, int]]) -> tuple[float, float]:
-    """鍵盤 (lane != 7) のみの時系列で階段率とトリル率を計算する。
-
-    textage のレーンマッピングは不明だが、隣り合うレーン番号への遷移を
-    階段、a→b→a の遷移をトリルと近似する。
-    """
-    keys = [(t, l) for t, l in notes if l != 7]
-    if len(keys) < 2:
-        return 0.0, 0.0
-    stair = 0
-    for i in range(1, len(keys)):
-        if abs(keys[i][1] - keys[i - 1][1]) == 1:
-            stair += 1
-    trill = 0
-    for i in range(2, len(keys)):
-        a, b, c = keys[i - 2][1], keys[i - 1][1], keys[i][1]
-        if a == c and a != b:
-            trill += 1
-    return stair / max(len(keys) - 1, 1), trill / max(len(keys) - 2, 1)
-
-
-def _has_long_notes(long_notes, charge_notes) -> int:
-    def any_nonzero(seq):
-        if not isinstance(seq, list):
-            return False
-        for x in seq:
-            if x is None or x == 0:
-                continue
-            if isinstance(x, list) and not x:
-                continue
-            return True
-        return False
-    return 1 if any_nonzero(long_notes) or any_nonzero(charge_notes) else 0
+            peak_center = (positions[left] + positions[right]) / 2.0
+    return max_count, peak_center
 
 
 def extract_features(
@@ -191,9 +138,21 @@ def extract_features(
     difficulty: str | None = None,
     long_notes=None,
     charge_notes=None,
+    tempo=None,
+    bpm: str | None = None,
 ) -> FeatureVector:
-    notes = parse_notes(raw_notes)
-    total_notes = len(notes)
+    """1 譜面分の生データを特徴量ベクトルへ変換する。
+
+    ``long_notes`` は textage の ``ln`` 配列 (小節長リスト)、``tempo`` は
+    ``tc`` 配列 (BPM 変化)、``bpm`` は表示用 BPM 文字列をそのまま渡す。
+    """
+    notes = decode_notes(raw_notes, long_notes)
+    cn_events = decode_charge_notes(charge_notes, long_notes)
+    cn_starts = [(pos, lane) for pos, lane, _length, flags in cn_events if flags & 1]
+
+    # CN の開始も「叩くノート」として通常ノートに合流させる
+    all_notes = sorted(set(notes) | set(cn_starts))
+    total_notes = len(all_notes)
 
     if total_notes == 0:
         return FeatureVector(
@@ -205,41 +164,91 @@ def extract_features(
             feature_names=list(FEATURE_NAMES),
         )
 
-    # 小節数推定: 最後の tick / TICKS_PER_BAR + 1
-    measures = (notes[-1][0] // TICKS_PER_BAR) + 1
-    density = total_notes / max(measures, 1)
+    # --- 基本量 -----------------------------------------------------------
+    span = all_notes[-1][0] - all_notes[0][0]
+    measures = int(span // LNDEF) + 1
+    density = total_notes / measures
 
-    # レーン別カウント
     lane_counts = np.zeros(N_LANES, dtype=float)
-    for _, lane in notes:
+    for _, lane in all_notes:
         lane_counts[lane] += 1
-    lane_ratios = lane_counts / total_notes
+    scratch_ratio = lane_counts[0] / total_notes
 
-    chord_sizes = _chord_sizes(notes)
+    chords = patterns.group_chords(all_notes)
+    chord_sizes = [len(lanes) for _, lanes in chords]
     mean_chord = float(np.mean(chord_sizes))
     max_chord = float(np.max(chord_sizes))
+    peak_density, peak_center = _peak_density([pos for pos, _ in all_notes])
+    span_start = all_notes[0][0]
+    peak_position = (peak_center - span_start) / span if span > 0 else 0.0
 
-    peak_density = _peak_density(notes, window=4)
-    stair_ratio, trill_ratio = _stair_trill_ratios(notes)
+    # --- 配置パターン検出 -------------------------------------------------
+    kchords = patterns.key_chords(chords)
+    stairs = patterns.detect_stairs(kchords)
+    trill_notes = patterns.detect_trills(kchords)
+    double_stair_notes = patterns.detect_double_stairs(kchords)
+    garbage_stair_notes = patterns.detect_garbage_stairs(kchords)
+    denim_notes = patterns.detect_denim(kchords)
+    chord_trill_notes = patterns.detect_chord_trills(kchords)
+    jack_notes = patterns.detect_jacks(all_notes)
+    wall_notes = patterns.detect_walls(kchords)
+    axis_notes = patterns.detect_axis(all_notes)
+    stream16_notes = patterns.detect_stream16(kchords)
+    scratch_stream_notes = patterns.detect_scratch_stream(all_notes)
+    scratch_mix_notes = patterns.detect_scratch_key_mix(all_notes)
+    offgrid_notes = patterns.count_offgrid(all_notes)
+    hand_bias = patterns.hand_bias(all_notes)
+
+    # 無理皿気味: 皿と 1,2 鍵が同時のイベント数 (1P 正規配置基準)
+    scratch_left_chords = sum(
+        1 for _pos, lanes in chords
+        if 0 in lanes and (1 in lanes or 2 in lanes)
+    )
+
+    mss_count = sum(
+        1 for _pos, lane, _length, flags in cn_events
+        if lane == 0 and flags & 4 and flags & 1
+    )
+    bpm_range_log2, bpm_changes = patterns.bpm_stats(tempo, bpm)
+
+    # RANDOM オプションの当たり外れシミュレーション
+    random_advantage, random_gamble, mirror_advantage = (
+        random_sim.randomness_features(chords)
+    )
 
     values = np.array([
         total_notes,
         measures,
         density,
-        lane_ratios[0],
-        lane_ratios[1],
-        lane_ratios[2],
-        lane_ratios[3],
-        lane_ratios[4],
-        lane_ratios[5],
-        lane_ratios[6],
-        lane_ratios[7],   # scratch_ratio
+        scratch_ratio,
         mean_chord,
         max_chord,
         peak_density,
-        stair_ratio,
-        trill_ratio,
-        _has_long_notes(long_notes, charge_notes),
+        stream16_notes / total_notes,
+        stairs.mono_notes / total_notes,
+        stairs.turn_notes / total_notes,
+        stairs.big_runs / measures,
+        double_stair_notes / total_notes,
+        garbage_stair_notes / total_notes,
+        denim_notes / total_notes,
+        chord_trill_notes / total_notes,
+        trill_notes / total_notes,
+        jack_notes / total_notes,
+        wall_notes / total_notes,
+        axis_notes / total_notes,
+        scratch_stream_notes / total_notes,
+        scratch_mix_notes / total_notes,
+        scratch_left_chords / total_notes,
+        mss_count / measures,
+        peak_position,
+        offgrid_notes / total_notes,
+        hand_bias,
+        len(cn_starts) / total_notes,
+        bpm_range_log2,
+        bpm_changes / measures,
+        random_advantage,
+        random_gamble,
+        mirror_advantage,
     ], dtype=float)
 
     return FeatureVector(

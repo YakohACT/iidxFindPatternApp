@@ -1,13 +1,16 @@
 """特徴量行列から譜面パターンを発見・保存・予測するモジュール。
 
-教師なし学習を 2 段階で適用する:
+処理の流れ:
 
-1. 標準化 + PCA で次元削減 (2 次元へ射影)
-2. KMeans でクラスタリング (シルエットスコアでクラスタ数を自動決定)
+1. StandardScaler で特徴量 (17 次元) を標準化する
+2. 標準化した全次元に対して KMeans でクラスタリングする
+   (クラスタ数はシルエット + Calinski-Harabasz の合成スコアで自動決定)
+3. PCA は **結果の 2 次元可視化 (散布図・座標出力) にのみ** 使用する。
+   クラスタリング自体は次元削減せず 17 次元のまま行う。
 
-学習後のモデル (Scaler / KMeans / PCA / クラスタ統計) は ``data/model/model.pkl``
-に永続化される。次回起動時に ``load_model`` で呼び出し、URL に対応する譜面の
-傾向を予測 (``predict``) できる。
+学習後のモデル (Scaler / KMeans / PCA / クラスタ統計 / 学習母集団の統計) は
+``data/model/model.pkl`` に永続化される。次回起動時に ``load_model`` で呼び出し、
+URL に対応する譜面の傾向を予測 (``predict``) できる。
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ class PatternResult:
     kmeans: KMeans
     pca: PCA
     cluster_names: dict[int, str]  # 各クラスタの自然言語ラベル
+    feature_mean: pd.Series        # 学習母集団の特徴量平均 (元スケール)
+    feature_std: pd.Series         # 学習母集団の特徴量標準偏差 (ddof=0)
 
 
 def _choose_k(
@@ -119,34 +124,63 @@ def _choose_k(
     )
 
 
-# クラスタ命名: 特徴量を眺めて「○○型」のラベルを付ける
-def _describe_cluster(profile_row: pd.Series, global_mean: pd.Series) -> str:
-    """クラスタの特徴量平均と全体平均を比較し、傾向ラベルを生成する。"""
-    diffs = (profile_row - global_mean) / (global_mean.abs() + 1e-9)
-    tags: list[str] = []
+# クラスタ命名: 全体平均からの z-score が大きい特徴量でラベルを付ける
+# (特徴量名, ラベル, 方向)。方向 +1 は「平均より高いとき」、-1 は「低いとき」。
+_TAG_DEFS: list[tuple[str, str, int]] = [
+    ("stair_mono_ratio", "単階段", +1),
+    ("stair_turn_ratio", "折返し階段", +1),
+    ("big_stair_rate", "大階段", +1),
+    ("double_stair_ratio", "二重階段", +1),
+    ("garbage_stair_ratio", "ゴミ付き階段", +1),
+    ("denim_ratio", "デニム", +1),
+    ("chord_trill_ratio", "二重トリル", +1),
+    ("trill_ratio", "トリル", +1),
+    ("jack_ratio", "縦連", +1),
+    ("wall_ratio", "壁", +1),
+    ("axis_ratio", "軸", +1),
+    ("scratch_stream_ratio", "連皿", +1),
+    ("scratch_key_mix_ratio", "皿複合", +1),
+    ("scratch_left_chord_ratio", "無理皿", +1),
+    ("scratch_ratio", "皿多め", +1),
+    ("mss_rate", "MSS", +1),
+    ("stream16_ratio", "乱打", +1),
+    ("peak_density", "発狂あり", +1),
+    ("peak_position", "終盤発狂", +1),
+    ("density", "高密度", +1),
+    ("density", "低密度", -1),
+    ("max_chord", "同時押し多", +1),
+    ("cn_ratio", "CN多め", +1),
+    ("offgrid_ratio", "ズレ/裏拍", +1),
+    ("hand_bias", "片手偏重", +1),
+    ("bpm_range_log2", "ソフラン(幅)", +1),
+    ("bpm_change_rate", "ソフラン(頻)", +1),
+    ("random_advantage", "乱推奨", +1),
+    ("random_advantage", "正規向き", -1),
+    ("random_gamble", "乱ガチャ", +1),
+    ("mirror_advantage", "鏡推奨", +1),
+]
 
-    def hi(name: str) -> bool:
-        return name in diffs and diffs[name] > 0.25
+_TAG_Z_THRESHOLD = 0.6  # このクラスタ平均が全体平均から何σ 離れていれば特徴とみなすか
+_TAG_MAX = 4            # ラベルに採用する最大タグ数
 
-    def lo(name: str) -> bool:
-        return name in diffs and diffs[name] < -0.25
 
-    if hi("scratch_ratio"):
-        tags.append("皿多め")
-    if hi("trill_ratio"):
-        tags.append("トリル多")
-    if hi("stair_ratio"):
-        tags.append("階段多")
-    if hi("peak_density"):
-        tags.append("発狂あり")
-    if hi("density"):
-        tags.append("ノート密度高")
-    elif lo("density"):
-        tags.append("低密度")
-    if hi("max_chord"):
-        tags.append("同時押し多")
-    if hi("has_long_notes"):
-        tags.append("CN/LN含")
+def _describe_cluster(
+    profile_row: pd.Series,
+    global_mean: pd.Series,
+    global_std: pd.Series,
+) -> str:
+    """クラスタの特徴量平均を全体分布と比較し、傾向ラベルを生成する。"""
+    std = global_std.replace(0, 1.0)
+    z = (profile_row - global_mean) / std
+    candidates: list[tuple[float, str]] = []
+    for name, label, direction in _TAG_DEFS:
+        if name not in z:
+            continue
+        score = float(z[name]) * direction
+        if score > _TAG_Z_THRESHOLD:
+            candidates.append((score, label))
+    candidates.sort(reverse=True)
+    tags = [label for _score, label in candidates[:_TAG_MAX]]
     if not tags:
         tags.append("標準")
     return "・".join(tags)
@@ -192,9 +226,11 @@ def find_patterns(
     df["cluster"] = labels
     cluster_means = df.groupby("cluster").mean()
 
-    global_mean = df.drop(columns=["cluster"]).mean()
+    features_only = df.drop(columns=["cluster"])
+    global_mean = features_only.mean()
+    global_std = features_only.std(ddof=0).replace(0, 1.0)
     cluster_names = {
-        int(c): _describe_cluster(cluster_means.loc[c], global_mean)
+        int(c): _describe_cluster(cluster_means.loc[c], global_mean, global_std)
         for c in cluster_means.index
     }
 
@@ -212,6 +248,8 @@ def find_patterns(
         kmeans=kmeans,
         pca=pca,
         cluster_names=cluster_names,
+        feature_mean=global_mean,
+        feature_std=global_std,
     )
 
 
@@ -229,6 +267,8 @@ def save_model(result: PatternResult, model_dir: Path) -> Path:
             "n_clusters": result.n_clusters,
             "silhouette": result.silhouette,
             "ch_score": result.ch_score,
+            "feature_mean": result.feature_mean,
+            "feature_std": result.feature_std,
         },
         path,
     )
@@ -245,6 +285,8 @@ class TrainedModel:
     n_clusters: int
     silhouette: float
     ch_score: float = 0.0
+    feature_mean: pd.Series | None = None  # 学習母集団の平均 (旧モデルでは None)
+    feature_std: pd.Series | None = None   # 学習母集団の標準偏差 (同上)
 
 
 def load_model(model_dir: Path) -> TrainedModel | None:
@@ -261,6 +303,8 @@ def load_model(model_dir: Path) -> TrainedModel | None:
         n_clusters=data["n_clusters"],
         silhouette=data["silhouette"],
         ch_score=float(data.get("ch_score", 0.0)),
+        feature_mean=data.get("feature_mean"),
+        feature_std=data.get("feature_std"),
     )
 
 
@@ -295,8 +339,13 @@ def predict(model: TrainedModel, fv: FeatureVector) -> Prediction:
     pca_xy = (float(coords[0]), float(coords[1]) if coords.size > 1 else 0.0)
 
     # この譜面が「全体平均と比べてどの特徴で外れているか」を z-score で算出
-    global_mean = model.cluster_profiles.mean()
-    global_std = model.cluster_profiles.std(ddof=0).replace(0, 1.0)
+    # (学習時に保存した母集団統計を使う。旧モデルはクラスタ重心の統計で代用)
+    if model.feature_mean is not None and model.feature_std is not None:
+        global_mean = model.feature_mean.reindex(feature_names)
+        global_std = model.feature_std.reindex(feature_names).replace(0, 1.0)
+    else:
+        global_mean = model.cluster_profiles.mean()
+        global_std = model.cluster_profiles.std(ddof=0).replace(0, 1.0)
     z = (pd.Series(x_raw[0], index=feature_names) - global_mean) / global_std
     top_feats = sorted(
         ((n, float(v)) for n, v in z.items()),

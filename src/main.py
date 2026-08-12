@@ -22,13 +22,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
 
 from features import extract_features, stack
 from ml import find_patterns, load_model, predict, save_model, save_report
-from scraper import INDEX_URLS, ChartRecord, TextageScraper
+from scraper import (
+    DEFAULT_REQUESTS_PER_HOUR,
+    INDEX_URLS,
+    ChartRecord,
+    TextageScraper,
+    parse_level_from_flags,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +98,21 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="--show-clusters 時に各クラスタから表示する譜面数 (既定 20)",
     )
+    p.add_argument(
+        "--min-notes",
+        type=int,
+        default=50,
+        metavar="N",
+        help="学習対象とする最低ノート数 (既定 50)。"
+             "デコードに失敗した異常譜面を学習から除外するためのフィルタ。",
+    )
+    p.add_argument(
+        "--rph",
+        type=int,
+        default=DEFAULT_REQUESTS_PER_HOUR,
+        metavar="N",
+        help=f"textage.cc への 1 時間あたり最大アクセス数 (既定 {DEFAULT_REQUESTS_PER_HOUR})",
+    )
     args = p.parse_args()
     if args.test and args.limit is None:
         args.limit = 50
@@ -102,17 +124,26 @@ def load_cached_records() -> list[ChartRecord]:
     if not charts_dir.exists():
         return []
     records: list[ChartRecord] = []
+    n_errors = 0
     for path in sorted(charts_dir.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            records.append(ChartRecord(**data))
-        except (json.JSONDecodeError, TypeError) as e:
-            print(f"[main] キャッシュ読み込みエラー ({path.name}): {e}")
+            rec = ChartRecord(**data)
+        except (json.JSONDecodeError, TypeError):
+            n_errors += 1
+            continue
+        # 旧スクレイパ時代のキャッシュは LEGGENDARIA 等の level が null のまま
+        # 保存されているため、song_id 末尾のフラグから補完する
+        if not rec.level:
+            rec.level = parse_level_from_flags(rec.song_id.rsplit("_", 1)[-1])
+        records.append(rec)
+    if n_errors:
+        print(f"[main] 旧形式で読めないキャッシュをスキップ: {n_errors} 件")
     return records
 
 
 async def scrape(args: argparse.Namespace) -> list[ChartRecord]:
-    scraper = TextageScraper(cache_dir=CACHE_DIR)
+    scraper = TextageScraper(cache_dir=CACHE_DIR, requests_per_hour=args.rph)
     # テスト時は一覧 URL を 1 件に絞って高速化
     index_urls = INDEX_URLS[:1] if args.test else INDEX_URLS
     if args.test:
@@ -121,6 +152,34 @@ async def scrape(args: argparse.Namespace) -> list[ChartRecord]:
             f"最大 {args.limit} 譜面を取得します"
         )
     return await scraper.run(index_urls, limit=args.limit)
+
+
+# song_id 例: "0_100seckb_1AA00" -> ("0_100seckb", "1", "AA00")
+SIDE_ID_RE = re.compile(r"^(.*)_([12])([A-Za-z0-9]+)$")
+
+
+def dedupe_play_sides(records: list[ChartRecord]) -> list[ChartRecord]:
+    """1P/2P 表示違いの同一譜面を 1 つに統合する (1P 優先)。
+
+    textage の 1P/2P はレーン配置の表示が違うだけでノートデータは同一のため、
+    両方を学習に入れると全譜面が二重カウントされてしまう。
+    """
+    best: dict = {}
+    order = []
+    for rec in records:
+        m = SIDE_ID_RE.match(rec.song_id)
+        if m:
+            key = (m.group(1), m.group(3))
+            side = m.group(2)
+        else:
+            key, side = rec.song_id, "1"
+        cur = best.get(key)
+        if cur is None:
+            best[key] = (side, rec)
+            order.append(key)
+        elif cur[0] == "2" and side == "1":
+            best[key] = (side, rec)
+    return [best[k][1] for k in order]
 
 
 def _record_to_feature(rec: ChartRecord):
@@ -132,6 +191,8 @@ def _record_to_feature(rec: ChartRecord):
         difficulty=rec.difficulty,
         long_notes=getattr(rec, "long_notes", None),
         charge_notes=getattr(rec, "charge_notes", None),
+        tempo=getattr(rec, "tempo", None),
+        bpm=getattr(rec, "bpm", None),
     )
 
 
@@ -141,21 +202,37 @@ def run_ml(
     k_min: int = 2,
     k_max: int = 20,
     score_method: str = "combined",
+    min_notes: int = 50,
 ) -> None:
     if not records:
         print("[main] 譜面データがありません。スクレイピング結果を確認してください。")
         return
 
+    n_before = len(records)
+    records = dedupe_play_sides(records)
+    if len(records) < n_before:
+        print(
+            f"[main] 1P/2P の重複譜面を統合: {n_before} 件 -> {len(records)} 件"
+        )
+
     features = []
-    skipped = 0
+    skipped_empty = 0
+    skipped_small = 0
     for rec in records:
         fv = _record_to_feature(rec)
-        if fv.values[0] > 0:
-            features.append(fv)
+        if fv.values[0] <= 0:
+            skipped_empty += 1
+        elif fv.values[0] < min_notes:
+            skipped_small += 1
         else:
-            skipped += 1
-    if skipped:
-        print(f"[main] ノート数 0 でスキップ: {skipped} 件")
+            features.append(fv)
+    if skipped_empty:
+        print(f"[main] ノート数 0 でスキップ: {skipped_empty} 件")
+    if skipped_small:
+        print(
+            f"[main] ノート数 {min_notes} 未満でスキップ: {skipped_small} 件 "
+            "(--min-notes で調整可)"
+        )
 
     print(f"[main] 有効な特徴量ベクトル: {len(features)} 件")
     matrix, items = stack(features)
@@ -209,8 +286,9 @@ def show_clusters(top_n: int) -> int:
         print("[main] 学習結果が空です")
         return 1
 
-    # 重心からの近さで並べたいので PCA 座標と距離を擬似的に使う
-    # (assignments.csv には distance が含まれないため、cluster 平均との距離を計算)
+    # 重心からの近さで並べたいので、特徴量を標準化した空間で
+    # クラスタ平均との距離を計算する (生スケールのままでは total_notes の
+    # ような大きい特徴量に距離が支配されてしまうため)
     feature_cols = [
         c for c in df.columns
         if c not in {
@@ -218,14 +296,12 @@ def show_clusters(top_n: int) -> int:
             "cluster", "cluster_name", "pca_x", "pca_y",
         }
     ]
-    cluster_means = df.groupby("cluster")[feature_cols].mean()
-
-    def dist(row) -> float:
-        c = int(row["cluster"])
-        diff = row[feature_cols].to_numpy(dtype=float) - cluster_means.loc[c].to_numpy()
-        return float((diff ** 2).sum() ** 0.5)
-
-    df = df.assign(_dist=df.apply(dist, axis=1))
+    feats = df[feature_cols].astype(float)
+    std = feats.std(ddof=0).replace(0, 1.0)
+    z = (feats - feats.mean()) / std
+    cluster_means = z.groupby(df["cluster"]).mean()
+    diff = z.to_numpy() - cluster_means.loc[df["cluster"].astype(int)].to_numpy()
+    df = df.assign(_dist=(diff ** 2).sum(axis=1) ** 0.5)
 
     total = len(df)
     n_clusters = df["cluster"].nunique()
@@ -288,11 +364,15 @@ async def predict_url(url: str) -> int:
 
     pred = predict(model, fv)
 
+    # ノート数・小節数は特徴量側の値を使う (旧キャッシュの値は不正確なため)
+    total_notes = int(fv.values[0])
+    measures = int(fv.values[1])
+    level = record.level or parse_level_from_flags(record.song_id.rsplit("_", 1)[-1])
     print("\n=== 予測結果 ===")
     print(f"  URL       : {record.url}")
     print(f"  タイトル  : {record.title} / {record.artist}")
-    print(f"  難易度    : {record.difficulty} {record.play_side} (Lv {record.level})")
-    print(f"  ノート数  : {record.notes_count}  (小節数={record.measures})")
+    print(f"  難易度    : {record.difficulty} {record.play_side} (Lv {level})")
+    print(f"  ノート数  : {total_notes}  (小節数={measures})")
     print()
     print(f"  クラスタ  : {pred.cluster}")
     print(f"  傾向ラベル: {pred.cluster_name}")
@@ -336,6 +416,7 @@ def main() -> int:
         k_min=args.min_k,
         k_max=args.max_k,
         score_method=args.score,
+        min_notes=args.min_notes,
     )
     return 0
 
